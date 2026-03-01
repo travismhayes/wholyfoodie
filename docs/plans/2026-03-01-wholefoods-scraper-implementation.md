@@ -4,11 +4,37 @@
 
 **Goal:** Build a CLI scraper that collects Whole Foods product data (name, brand, price) and enriches it with nutrition/macros from Open Food Facts and USDA, all stored in a local SQLite database.
 
-**Architecture:** Saloon v3 connectors for all HTTP (Whole Foods site, Open Food Facts API, USDA API). Spatie Crawler + Symfony DomCrawler as fallback for HTML parsing. SQLite for storage. Config-driven rate limiting and retry behavior.
+**Architecture:** Thin commands delegate to Action and Support classes. Saloon v3 connectors for all HTTP. Fat models own their scopes and domain logic. Support classes handle parsing and data mapping.
 
 **Tech Stack:** Laravel Zero 12, Saloon v3, Spatie Crawler, Symfony DomCrawler, Pest 4, SQLite
 
 **Design doc:** `docs/plans/2026-03-01-wholefoods-scraper-design.md`
+
+**Class map:**
+```
+app/
+├── Actions/
+│   ├── UpsertProduct.php          # Create or update a product from parsed data
+│   └── EnrichProductNutrition.php # Save nutrition data to a product
+├── Commands/
+│   ├── SeedCategoriesCommand.php
+│   ├── ScrapeDiscoverCommand.php
+│   ├── ScrapeProductsCommand.php  # Thin — delegates to parser + action
+│   ├── EnrichNutritionCommand.php # Thin — delegates to resolver + action
+│   └── ScrapeUpdateCommand.php    # Convenience wrapper
+├── Http/Integrations/
+│   ├── WholeFoods/
+│   ├── OpenFoodFacts/
+│   └── Usda/
+├── Models/
+│   ├── Category.php               # scopeForScraping(), needsScraping()
+│   ├── Product.php                 # scopeNeedsNutrition()
+│   ├── Nutrition.php
+│   └── ScrapeLog.php
+└── Support/
+    ├── ProductPageParser.php       # HTML → product data arrays
+    └── NutritionResolver.php       # Tries OFF → USDA, returns normalized data
+```
 
 ---
 
@@ -98,8 +124,7 @@ git commit -m "Add scraping config with rate limits, delays, and categories"
 - Create: `database/migrations/2026_03_01_000002_create_products_table.php`
 - Create: `database/migrations/2026_03_01_000003_create_nutrition_table.php`
 - Create: `database/migrations/2026_03_01_000004_create_scrape_logs_table.php`
-
-Delete the existing `database/migrations/2026_02_02_151440_create_flight_tables.php` — it's a placeholder from scaffolding.
+- Delete: `database/migrations/2026_02_02_151440_create_flight_tables.php`
 
 **Step 1: Write the categories migration**
 
@@ -240,21 +265,122 @@ git commit -m "Add categories, products, nutrition, and scrape_logs migrations"
 
 ---
 
-### Task 4: Create Eloquent models
+### Task 4: Create Eloquent models with scopes
 
 **Files:**
 - Create: `app/Models/Category.php`
 - Create: `app/Models/Product.php`
 - Create: `app/Models/Nutrition.php`
 - Create: `app/Models/ScrapeLog.php`
+- Test: `tests/Feature/Models/CategoryTest.php`
+- Test: `tests/Feature/Models/ProductTest.php`
 
-**Step 1: Write Category model**
+**Step 1: Write the failing tests**
+
+`tests/Feature/Models/CategoryTest.php`:
+
+```php
+<?php
+
+use App\Models\Category;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
+
+it('knows when it needs scraping with no previous scrape', function () {
+    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+
+    expect($category->needsScraping())->toBeTrue();
+});
+
+it('knows when it needs scraping after expiry', function () {
+    $category = Category::create([
+        'name' => 'Produce',
+        'slug' => 'produce',
+        'last_scraped_at' => now()->subDays(8),
+    ]);
+
+    expect($category->needsScraping())->toBeTrue();
+});
+
+it('knows when it is still fresh', function () {
+    $category = Category::create([
+        'name' => 'Produce',
+        'slug' => 'produce',
+        'last_scraped_at' => now()->subDay(),
+    ]);
+
+    expect($category->needsScraping())->toBeFalse();
+});
+
+it('scopes to categories that need scraping', function () {
+    Category::create(['name' => 'Stale', 'slug' => 'stale', 'last_scraped_at' => now()->subDays(8)]);
+    Category::create(['name' => 'Fresh', 'slug' => 'fresh', 'last_scraped_at' => now()->subDay()]);
+    Category::create(['name' => 'Never', 'slug' => 'never']);
+
+    expect(Category::forScraping()->count())->toBe(2);
+});
+
+it('scopes by slug', function () {
+    Category::create(['name' => 'Produce', 'slug' => 'produce']);
+    Category::create(['name' => 'Meat', 'slug' => 'meat']);
+
+    expect(Category::bySlug('produce')->count())->toBe(1);
+});
+```
+
+`tests/Feature/Models/ProductTest.php`:
+
+```php
+<?php
+
+use App\Models\Category;
+use App\Models\Nutrition;
+use App\Models\Product;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
+
+it('scopes to products needing nutrition', function () {
+    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+
+    $withNutrition = Product::create([
+        'category_id' => $category->id,
+        'name' => 'Bananas',
+        'price' => 0.29,
+    ]);
+
+    Nutrition::create([
+        'product_id' => $withNutrition->id,
+        'calories' => 105,
+        'source' => 'manual',
+    ]);
+
+    Product::create([
+        'category_id' => $category->id,
+        'name' => 'Avocados',
+        'price' => 1.99,
+    ]);
+
+    expect(Product::needsNutrition()->count())->toBe(1);
+    expect(Product::needsNutrition()->first()->name)->toBe('Avocados');
+});
+```
+
+**Step 2: Run tests to verify they fail**
+
+Run: `./vendor/bin/pest --filter CategoryTest --filter ProductTest`
+
+Expected: FAIL — models don't exist.
+
+**Step 3: Write Category model**
 
 ```php
 <?php
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 
@@ -285,16 +411,34 @@ class Category extends Model
 
         return $this->last_scraped_at->diffInDays(now()) >= $maxAgeDays;
     }
+
+    /** @param Builder<self> $query */
+    public function scopeForScraping(Builder $query): void
+    {
+        $maxAgeDays = config('scraping.freshness.category_max_age_days', 7);
+
+        $query->where(function (Builder $q) use ($maxAgeDays) {
+            $q->whereNull('last_scraped_at')
+                ->orWhere('last_scraped_at', '<=', now()->subDays($maxAgeDays));
+        });
+    }
+
+    /** @param Builder<self> $query */
+    public function scopeBySlug(Builder $query, string $slug): void
+    {
+        $query->where('slug', $slug);
+    }
 }
 ```
 
-**Step 2: Write Product model**
+**Step 4: Write Product model**
 
 ```php
 <?php
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasOne;
@@ -323,14 +467,15 @@ class Product extends Model
         return $this->hasOne(Nutrition::class);
     }
 
-    public function hasNutrition(): bool
+    /** @param Builder<self> $query */
+    public function scopeNeedsNutrition(Builder $query): void
     {
-        return $this->nutrition()->exists();
+        $query->whereDoesntHave('nutrition');
     }
 }
 ```
 
-**Step 3: Write Nutrition model**
+**Step 5: Write Nutrition model**
 
 ```php
 <?php
@@ -367,7 +512,7 @@ class Nutrition extends Model
 }
 ```
 
-**Step 4: Write ScrapeLog model**
+**Step 6: Write ScrapeLog model**
 
 ```php
 <?php
@@ -399,20 +544,26 @@ class ScrapeLog extends Model
 }
 ```
 
-**Step 5: Commit**
+**Step 7: Run tests to verify they pass**
+
+Run: `./vendor/bin/pest --filter CategoryTest --filter ProductTest`
+
+Expected: PASS
+
+**Step 8: Commit**
 
 ```bash
-git add app/Models/
-git commit -m "Add Category, Product, Nutrition, and ScrapeLog models"
+git add app/Models/ tests/Feature/Models/
+git commit -m "Add Category, Product, Nutrition, ScrapeLog models with scopes"
 ```
 
 ---
 
-### Task 5: Seed categories from config
+### Task 5: Seed categories command
 
 **Files:**
 - Create: `app/Commands/SeedCategoriesCommand.php`
-- Test: `tests/Feature/SeedCategoriesCommandTest.php`
+- Test: `tests/Feature/Commands/SeedCategoriesCommandTest.php`
 
 **Step 1: Write the failing test**
 
@@ -490,7 +641,7 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add app/Commands/SeedCategoriesCommand.php tests/Feature/SeedCategoriesCommandTest.php
+git add app/Commands/SeedCategoriesCommand.php tests/Feature/Commands/SeedCategoriesCommandTest.php
 git commit -m "Add seed:categories command with tests"
 ```
 
@@ -500,9 +651,10 @@ git commit -m "Add seed:categories command with tests"
 
 **Files:**
 - Modify: `app/Http/Integrations/WholeFoods/WholeFoodsConnector.php`
+- Modify: `app/Http/Integrations/WholeFoods/Requests/GetProductsRequest.php`
 - Modify: `tests/Feature/WholeFoodsConnectorTest.php`
 
-**Step 1: Write the failing test for rate limit config**
+**Step 1: Write the failing test**
 
 Add to `tests/Feature/WholeFoodsConnectorTest.php`:
 
@@ -517,7 +669,7 @@ it('uses user agent from config', function () {
     $connector = new WholeFoodsConnector;
     $connector->withMockClient($mockClient);
 
-    $connector->send(new GetProductsRequest);
+    $connector->send(new GetProductsRequest('produce'));
 
     $mockClient->assertSent(function ($request) {
         return $request->headers()->get('User-Agent') === 'TestAgent/1.0';
@@ -529,7 +681,7 @@ it('uses user agent from config', function () {
 
 Run: `./vendor/bin/pest --filter WholeFoodsConnectorTest`
 
-Expected: FAIL — User-Agent is still hardcoded.
+Expected: FAIL — User-Agent still hardcoded, GetProductsRequest doesn't accept args.
 
 **Step 3: Update the connector**
 
@@ -585,22 +737,57 @@ class WholeFoodsConnector extends Connector
 }
 ```
 
-**Step 4: Run test to verify it passes**
+**Step 4: Update GetProductsRequest to accept category and page**
+
+```php
+<?php
+
+namespace App\Http\Integrations\WholeFoods\Requests;
+
+use Saloon\Enums\Method;
+use Saloon\Http\Request;
+
+class GetProductsRequest extends Request
+{
+    protected Method $method = Method::GET;
+
+    public function __construct(protected string $category = '', protected int $page = 1) {}
+
+    public function resolveEndpoint(): string
+    {
+        return "/products/{$this->category}";
+    }
+
+    /** @return array<string, mixed> */
+    protected function defaultQuery(): array
+    {
+        return [
+            'page' => $this->page,
+        ];
+    }
+}
+```
+
+**Step 5: Update existing tests for new constructor signature**
+
+The existing tests in `WholeFoodsConnectorTest.php` need `new GetProductsRequest` changed to `new GetProductsRequest('produce')` since the constructor now requires a category. Update both existing `it()` blocks.
+
+**Step 6: Run tests to verify they pass**
 
 Run: `./vendor/bin/pest --filter WholeFoodsConnectorTest`
 
 Expected: PASS
 
-**Step 5: Commit**
+**Step 7: Commit**
 
 ```bash
-git add app/Http/Integrations/WholeFoods/WholeFoodsConnector.php tests/Feature/WholeFoodsConnectorTest.php
+git add app/Http/Integrations/WholeFoods/ tests/Feature/WholeFoodsConnectorTest.php
 git commit -m "Add rate limiting and retry logic to WholeFoodsConnector"
 ```
 
 ---
 
-### Task 7: Create OpenFoodFactsConnector
+### Task 7: Create OpenFoodFacts connector
 
 **Files:**
 - Create: `app/Http/Integrations/OpenFoodFacts/OpenFoodFactsConnector.php`
@@ -633,11 +820,6 @@ it('can search products by name', function () {
                     'nutriments' => [
                         'energy-kcal_serving' => 150,
                         'proteins_serving' => 8,
-                        'fat_serving' => 8,
-                        'carbohydrates_serving' => 12,
-                        'fiber_serving' => 0,
-                        'sugars_serving' => 12,
-                        'sodium_serving' => 0.125,
                     ],
                 ],
             ],
@@ -660,9 +842,7 @@ it('can look up a product by barcode', function () {
             'status' => 1,
             'product' => [
                 'product_name' => 'Organic Bananas',
-                'nutriments' => [
-                    'energy-kcal_serving' => 105,
-                ],
+                'nutriments' => ['energy-kcal_serving' => 105],
             ],
         ], 200),
     ]);
@@ -683,9 +863,7 @@ Run: `./vendor/bin/pest --filter OpenFoodFactsConnectorTest`
 
 Expected: FAIL — classes don't exist.
 
-**Step 3: Write the connector and requests**
-
-`app/Http/Integrations/OpenFoodFacts/OpenFoodFactsConnector.php`:
+**Step 3: Write the connector**
 
 ```php
 <?php
@@ -712,7 +890,7 @@ class OpenFoodFactsConnector extends Connector
 }
 ```
 
-`app/Http/Integrations/OpenFoodFacts/Requests/SearchProductsRequest.php`:
+**Step 4: Write SearchProductsRequest**
 
 ```php
 <?php
@@ -746,7 +924,7 @@ class SearchProductsRequest extends Request
 }
 ```
 
-`app/Http/Integrations/OpenFoodFacts/Requests/GetProductByBarcodeRequest.php`:
+**Step 5: Write GetProductByBarcodeRequest**
 
 ```php
 <?php
@@ -769,13 +947,13 @@ class GetProductByBarcodeRequest extends Request
 }
 ```
 
-**Step 4: Run test to verify it passes**
+**Step 6: Run test to verify it passes**
 
 Run: `./vendor/bin/pest --filter OpenFoodFactsConnectorTest`
 
 Expected: PASS
 
-**Step 5: Commit**
+**Step 7: Commit**
 
 ```bash
 git add app/Http/Integrations/OpenFoodFacts/ tests/Feature/OpenFoodFactsConnectorTest.php
@@ -784,7 +962,7 @@ git commit -m "Add OpenFoodFacts connector with search and barcode lookup"
 
 ---
 
-### Task 8: Create UsdaConnector
+### Task 8: Create USDA connector
 
 **Files:**
 - Create: `app/Http/Integrations/Usda/UsdaConnector.php`
@@ -816,8 +994,6 @@ it('can search foods by name', function () {
                     'foodNutrients' => [
                         ['nutrientName' => 'Energy', 'value' => 120, 'unitName' => 'KCAL'],
                         ['nutrientName' => 'Protein', 'value' => 22.5, 'unitName' => 'G'],
-                        ['nutrientName' => 'Total lipid (fat)', 'value' => 2.6, 'unitName' => 'G'],
-                        ['nutrientName' => 'Carbohydrate, by difference', 'value' => 0, 'unitName' => 'G'],
                     ],
                 ],
             ],
@@ -830,7 +1006,6 @@ it('can search foods by name', function () {
     $response = $connector->send(new SearchFoodsRequest('chicken breast'));
 
     expect($response->status())->toBe(200);
-    expect($response->json('foods'))->toHaveCount(1);
     expect($response->json('foods.0.description'))->toBe('Chicken breast, raw');
 });
 ```
@@ -841,9 +1016,7 @@ Run: `./vendor/bin/pest --filter UsdaConnectorTest`
 
 Expected: FAIL — classes don't exist.
 
-**Step 3: Write the connector and request**
-
-`app/Http/Integrations/Usda/UsdaConnector.php`:
+**Step 3: Write the connector**
 
 ```php
 <?php
@@ -877,7 +1050,7 @@ class UsdaConnector extends Connector
 }
 ```
 
-`app/Http/Integrations/Usda/Requests/SearchFoodsRequest.php`:
+**Step 4: Write SearchFoodsRequest**
 
 ```php
 <?php
@@ -910,13 +1083,13 @@ class SearchFoodsRequest extends Request
 }
 ```
 
-**Step 4: Run test to verify it passes**
+**Step 5: Run test to verify it passes**
 
 Run: `./vendor/bin/pest --filter UsdaConnectorTest`
 
 Expected: PASS
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add app/Http/Integrations/Usda/ tests/Feature/UsdaConnectorTest.php
@@ -925,195 +1098,22 @@ git commit -m "Add USDA FoodData Central connector with food search"
 
 ---
 
-### Task 9: Create scrape:discover command
+### Task 9: Create ProductPageParser support class
 
-This is the exploration command that hits the Whole Foods site to figure out what endpoints exist and how the data is structured. It does NOT persist data — it just prints findings to the console.
+This is the class that owns all HTML parsing logic. It takes raw HTML and returns clean, normalized product data arrays. When selectors change (and they will), you only update this one file.
 
 **Files:**
-- Create: `app/Commands/ScrapeDiscoverCommand.php`
-- Test: `tests/Feature/ScrapeDiscoverCommandTest.php`
+- Create: `app/Support/ProductPageParser.php`
+- Test: `tests/Unit/ProductPageParserTest.php`
 
 **Step 1: Write the failing test**
 
 ```php
 <?php
 
-use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
-use Saloon\Http\Faking\MockClient;
-use Saloon\Http\Faking\MockResponse;
+use App\Support\ProductPageParser;
 
-beforeEach(function () {
-    Saloon\Config::preventStrayRequests();
-});
-
-it('discovers product page structure', function () {
-    $html = <<<'HTML'
-    <html>
-    <body>
-        <div class="w-pie--product-tile" data-testid="product-tile">
-            <h2 class="w-cms--font-body__sans-bold">Organic Bananas</h2>
-            <span class="text-left bds--heading-5">$0.29</span>
-        </div>
-    </body>
-    </html>
-    HTML;
-
-    $mockClient = new MockClient([
-        '*' => MockResponse::make($html, 200),
-    ]);
-
-    $connector = new WholeFoodsConnector;
-    $connector->withMockClient($mockClient);
-    $this->app->instance(WholeFoodsConnector::class, $connector);
-
-    $this->artisan('scrape:discover', ['--category' => 'produce'])
-        ->assertExitCode(0);
-});
-```
-
-**Step 2: Run test to verify it fails**
-
-Run: `./vendor/bin/pest --filter ScrapeDiscoverCommandTest`
-
-Expected: FAIL — command not found.
-
-**Step 3: Write the command**
-
-```php
-<?php
-
-namespace App\Commands;
-
-use App\Http\Integrations\WholeFoods\Requests\GetProductsRequest;
-use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
-use LaravelZero\Framework\Commands\Command;
-use Symfony\Component\DomCrawler\Crawler;
-
-class ScrapeDiscoverCommand extends Command
-{
-    protected $signature = 'scrape:discover
-        {--category=produce : Category slug to explore}';
-
-    protected $description = 'Explore the Whole Foods site to discover product page structure';
-
-    public function handle(WholeFoodsConnector $connector): void
-    {
-        $category = $this->option('category');
-        $this->info("Discovering product page structure for: {$category}");
-
-        $request = new GetProductsRequest($category);
-        $response = $connector->send($request);
-
-        $this->line("Status: {$response->status()}");
-        $this->line("Content-Type: {$response->header('Content-Type')}");
-
-        $body = $response->body();
-        $this->line("Body length: " . strlen($body) . " bytes");
-
-        if (str_contains($response->header('Content-Type') ?? '', 'json')) {
-            $this->info('Response is JSON — API endpoint found!');
-            $this->line(json_encode(json_decode($body), JSON_PRETTY_PRINT));
-
-            return;
-        }
-
-        $crawler = new Crawler($body);
-
-        $productSelectors = [
-            '[data-testid="product-tile"]',
-            '.w-pie--product-tile',
-            '.product-tile',
-            '.product',
-            '[class*="product"]',
-        ];
-
-        foreach ($productSelectors as $selector) {
-            $count = $crawler->filter($selector)->count();
-            $this->line("Selector '{$selector}': {$count} matches");
-        }
-
-        $this->newLine();
-        $this->comment('Check output above to determine which selectors work.');
-        $this->comment('Update GetProductsRequest and ProductCrawlObserver accordingly.');
-    }
-}
-```
-
-**Step 4: Update GetProductsRequest to accept a category slug**
-
-```php
-<?php
-
-namespace App\Http\Integrations\WholeFoods\Requests;
-
-use Saloon\Enums\Method;
-use Saloon\Http\Request;
-
-class GetProductsRequest extends Request
-{
-    protected Method $method = Method::GET;
-
-    public function __construct(protected string $category = '', protected int $page = 1) {}
-
-    public function resolveEndpoint(): string
-    {
-        return "/products/{$this->category}";
-    }
-
-    /** @return array<string, mixed> */
-    protected function defaultQuery(): array
-    {
-        return [
-            'page' => $this->page,
-        ];
-    }
-}
-```
-
-**Step 5: Run test to verify it passes**
-
-Run: `./vendor/bin/pest --filter ScrapeDiscoverCommandTest`
-
-Expected: PASS
-
-**Step 6: Commit**
-
-```bash
-git add app/Commands/ScrapeDiscoverCommand.php app/Http/Integrations/WholeFoods/Requests/GetProductsRequest.php tests/Feature/ScrapeDiscoverCommandTest.php
-git commit -m "Add scrape:discover command for site exploration"
-```
-
----
-
-### Task 10: Create scrape:products command
-
-**Files:**
-- Create: `app/Commands/ScrapeProductsCommand.php`
-- Modify: `app/Crawlers/ProductCrawlObserver.php`
-- Test: `tests/Feature/ScrapeProductsCommandTest.php`
-
-**Step 1: Write the failing test**
-
-```php
-<?php
-
-use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
-use App\Models\Category;
-use App\Models\Product;
-use App\Models\ScrapeLog;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Saloon\Http\Faking\MockClient;
-use Saloon\Http\Faking\MockResponse;
-
-uses(RefreshDatabase::class);
-
-beforeEach(function () {
-    Saloon\Config::preventStrayRequests();
-});
-
-it('scrapes products for a category and stores them', function () {
-    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
-
+it('parses product tiles from html', function () {
     $html = <<<'HTML'
     <html><body>
         <div class="w-pie--product-tile" data-testid="product-tile">
@@ -1121,6 +1121,8 @@ it('scrapes products for a category and stores them', function () {
             <span class="w-pie--product-tile__brand">365 by Whole Foods Market</span>
             <span data-testid="product-tile-price">$0.29</span>
             <span data-testid="product-tile-unit">/ ea</span>
+            <a href="/products/bananas-123">Link</a>
+            <img src="https://cdn.example.com/bananas.jpg" />
         </div>
         <div class="w-pie--product-tile" data-testid="product-tile">
             <h2 class="w-cms--font-body__sans-bold">Organic Avocados</h2>
@@ -1131,137 +1133,133 @@ it('scrapes products for a category and stores them', function () {
     </body></html>
     HTML;
 
-    $mockClient = new MockClient([
-        '*' => MockResponse::make($html, 200),
-    ]);
+    $parser = new ProductPageParser;
+    $products = $parser->parse($html);
 
-    $connector = new WholeFoodsConnector;
-    $connector->withMockClient($mockClient);
-    $this->app->instance(WholeFoodsConnector::class, $connector);
+    expect($products)->toHaveCount(2);
 
-    $this->artisan('scrape:products', ['--category' => 'produce', '--limit' => 1])
-        ->assertExitCode(0);
-
-    expect(Product::count())->toBe(2);
-    expect(Product::where('name', 'Organic Bananas')->first()->price)->toBe('0.29');
-    expect(ScrapeLog::count())->toBe(1);
-    expect(ScrapeLog::first()->products_created)->toBe(2);
-});
-
-it('updates existing product prices on re-scrape', function () {
-    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
-    Product::create([
-        'category_id' => $category->id,
+    expect($products[0])->toMatchArray([
         'name' => 'Organic Bananas',
         'brand' => '365 by Whole Foods Market',
-        'price' => 0.25,
+        'price' => '0.29',
+        'unit' => '/ ea',
+        'url' => '/products/bananas-123',
+        'image_url' => 'https://cdn.example.com/bananas.jpg',
     ]);
 
+    expect($products[1]['name'])->toBe('Organic Avocados');
+    expect($products[1]['price'])->toBe('1.99');
+});
+
+it('returns empty array for html with no products', function () {
+    $html = '<html><body><p>No products here</p></body></html>';
+
+    $parser = new ProductPageParser;
+
+    expect($parser->parse($html))->toBeEmpty();
+});
+
+it('skips tiles with no product name', function () {
     $html = <<<'HTML'
     <html><body>
         <div class="w-pie--product-tile" data-testid="product-tile">
-            <h2 class="w-cms--font-body__sans-bold">Organic Bananas</h2>
-            <span class="w-pie--product-tile__brand">365 by Whole Foods Market</span>
             <span data-testid="product-tile-price">$0.29</span>
-            <span data-testid="product-tile-unit">/ ea</span>
         </div>
     </body></html>
     HTML;
 
-    $mockClient = new MockClient([
-        '*' => MockResponse::make($html, 200),
-    ]);
+    $parser = new ProductPageParser;
 
-    $connector = new WholeFoodsConnector;
-    $connector->withMockClient($mockClient);
-    $this->app->instance(WholeFoodsConnector::class, $connector);
+    expect($parser->parse($html))->toBeEmpty();
+});
 
-    $this->artisan('scrape:products', ['--category' => 'produce', '--force' => true, '--limit' => 1])
-        ->assertExitCode(0);
+it('extracts price as numeric string without dollar sign', function () {
+    $html = <<<'HTML'
+    <html><body>
+        <div class="w-pie--product-tile" data-testid="product-tile">
+            <h2>Salmon Fillet</h2>
+            <span data-testid="product-tile-price">$12.99 /lb</span>
+        </div>
+    </body></html>
+    HTML;
 
-    expect(Product::count())->toBe(1);
-    expect(Product::first()->price)->toBe('0.29');
-    expect(ScrapeLog::first()->products_updated)->toBe(1);
+    $parser = new ProductPageParser;
+    $products = $parser->parse($html);
+
+    expect($products[0]['price'])->toBe('12.99');
 });
 ```
 
 **Step 2: Run test to verify it fails**
 
-Run: `./vendor/bin/pest --filter ScrapeProductsCommandTest`
+Run: `./vendor/bin/pest --filter ProductPageParserTest`
 
-Expected: FAIL — command not found.
+Expected: FAIL — class doesn't exist.
 
-**Step 3: Update ProductCrawlObserver to extract richer data**
-
-Note: The CSS selectors below are placeholders based on research. They WILL need to be adjusted after running `scrape:discover` against the live site. That's expected — run discover first, then update these selectors to match what the site actually serves.
+**Step 3: Write the parser**
 
 ```php
 <?php
 
-namespace App\Crawlers;
+namespace App\Support;
 
-use GuzzleHttp\Exception\RequestException;
-use Psr\Http\Message\ResponseInterface;
-use Psr\Http\Message\UriInterface;
-use Spatie\Crawler\CrawlObservers\CrawlObserver;
 use Symfony\Component\DomCrawler\Crawler;
 
-class ProductCrawlObserver extends CrawlObserver
+class ProductPageParser
 {
-    /** @var array<int, array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null}> */
-    protected array $products = [];
+    protected string $tileSelector = '[data-testid="product-tile"]';
 
-    public function crawled(
-        UriInterface $url,
-        ResponseInterface $response,
-        ?UriInterface $foundOnUrl = null,
-        ?string $linkText = null
-    ): void {
-        $html = (string) $response->getBody();
-        $crawler = new Crawler($html);
+    protected string $nameSelector = 'h2';
 
-        $crawler->filter('[data-testid="product-tile"]')->each(function (Crawler $node) {
-            $this->products[] = [
-                'name' => $this->extractText($node, 'h2'),
-                'brand' => $this->extractText($node, '[class*="brand"]'),
-                'price' => $this->extractPrice($node),
-                'unit' => $this->extractText($node, '[data-testid="product-tile-unit"]'),
-                'url' => $this->extractAttr($node, 'a', 'href'),
-                'image_url' => $this->extractAttr($node, 'img', 'src'),
-            ];
-        });
-    }
+    protected string $brandSelector = '[class*="brand"]';
 
-    public function crawlFailed(
-        UriInterface $url,
-        RequestException $requestException,
-        ?UriInterface $foundOnUrl = null,
-        ?string $linkText = null
-    ): void {}
+    protected string $priceSelector = '[data-testid="product-tile-price"]';
+
+    protected string $unitSelector = '[data-testid="product-tile-unit"]';
 
     /** @return array<int, array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null}> */
-    public function getProducts(): array
+    public function parse(string $html): array
     {
-        return $this->products;
+        $crawler = new Crawler($html);
+        $products = [];
+
+        $crawler->filter($this->tileSelector)->each(function (Crawler $node) use (&$products) {
+            $name = $this->text($node, $this->nameSelector);
+
+            if (! $name) {
+                return;
+            }
+
+            $products[] = [
+                'name' => $name,
+                'brand' => $this->text($node, $this->brandSelector),
+                'price' => $this->price($node),
+                'unit' => $this->text($node, $this->unitSelector),
+                'url' => $this->attr($node, 'a', 'href'),
+                'image_url' => $this->attr($node, 'img', 'src'),
+            ];
+        });
+
+        return $products;
     }
 
-    protected function extractText(Crawler $node, string $selector): ?string
+    protected function text(Crawler $node, string $selector): ?string
     {
         $filtered = $node->filter($selector);
 
         return $filtered->count() > 0 ? trim($filtered->text('')) : null;
     }
 
-    protected function extractAttr(Crawler $node, string $selector, string $attr): ?string
+    protected function attr(Crawler $node, string $selector, string $attribute): ?string
     {
         $filtered = $node->filter($selector);
 
-        return $filtered->count() > 0 ? $filtered->attr($attr) : null;
+        return $filtered->count() > 0 ? $filtered->attr($attribute) : null;
     }
 
-    protected function extractPrice(Crawler $node): ?string
+    protected function price(Crawler $node): ?string
     {
-        $text = $this->extractText($node, '[data-testid="product-tile-price"]');
+        $text = $this->text($node, $this->priceSelector);
 
         if (! $text) {
             return null;
@@ -1274,156 +1272,129 @@ class ProductCrawlObserver extends CrawlObserver
 }
 ```
 
-**Step 4: Write the command**
+**Step 4: Run test to verify it passes**
+
+Run: `./vendor/bin/pest --filter ProductPageParserTest`
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add app/Support/ProductPageParser.php tests/Unit/ProductPageParserTest.php
+git commit -m "Add ProductPageParser for HTML product extraction"
+```
+
+---
+
+### Task 10: Create UpsertProduct action
+
+Simple action: takes a Category and a parsed product data array, creates or updates, returns what happened.
+
+**Files:**
+- Create: `app/Actions/UpsertProduct.php`
+- Test: `tests/Unit/UpsertProductTest.php`
+
+**Step 1: Write the failing test**
 
 ```php
 <?php
 
-namespace App\Commands;
-
-use App\Http\Integrations\WholeFoods\Requests\GetProductsRequest;
-use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
+use App\Actions\UpsertProduct;
 use App\Models\Category;
 use App\Models\Product;
-use App\Models\ScrapeLog;
-use LaravelZero\Framework\Commands\Command;
-use Symfony\Component\DomCrawler\Crawler;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 
-class ScrapeProductsCommand extends Command
+uses(RefreshDatabase::class);
+
+it('creates a new product', function () {
+    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+
+    $result = (new UpsertProduct)->execute($category, [
+        'name' => 'Organic Bananas',
+        'brand' => '365',
+        'price' => '0.29',
+        'unit' => '/ ea',
+        'url' => '/products/bananas',
+        'image_url' => 'https://cdn.example.com/bananas.jpg',
+    ]);
+
+    expect($result)->toBe('created');
+    expect(Product::count())->toBe(1);
+    expect(Product::first()->name)->toBe('Organic Bananas');
+    expect(Product::first()->price)->toBe('0.29');
+});
+
+it('updates an existing product price', function () {
+    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+    Product::create([
+        'category_id' => $category->id,
+        'name' => 'Organic Bananas',
+        'brand' => '365',
+        'price' => 0.25,
+    ]);
+
+    $result = (new UpsertProduct)->execute($category, [
+        'name' => 'Organic Bananas',
+        'brand' => '365',
+        'price' => '0.29',
+        'unit' => '/ ea',
+        'url' => null,
+        'image_url' => null,
+    ]);
+
+    expect($result)->toBe('updated');
+    expect(Product::count())->toBe(1);
+    expect(Product::first()->price)->toBe('0.29');
+});
+
+it('treats different brands as different products', function () {
+    $category = Category::create(['name' => 'Dairy', 'slug' => 'dairy']);
+
+    $action = new UpsertProduct;
+
+    $action->execute($category, [
+        'name' => 'Whole Milk',
+        'brand' => '365',
+        'price' => '3.99',
+        'unit' => null,
+        'url' => null,
+        'image_url' => null,
+    ]);
+
+    $action->execute($category, [
+        'name' => 'Whole Milk',
+        'brand' => 'Organic Valley',
+        'price' => '5.99',
+        'unit' => null,
+        'url' => null,
+        'image_url' => null,
+    ]);
+
+    expect(Product::count())->toBe(2);
+});
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `./vendor/bin/pest --filter UpsertProductTest`
+
+Expected: FAIL — class doesn't exist.
+
+**Step 3: Write the action**
+
+```php
+<?php
+
+namespace App\Actions;
+
+use App\Models\Category;
+use App\Models\Product;
+
+class UpsertProduct
 {
-    protected $signature = 'scrape:products
-        {--category= : Scrape a single category by slug}
-        {--force : Ignore freshness interval}
-        {--limit=10 : Max pages per category}';
-
-    protected $description = 'Scrape products from Whole Foods';
-
-    public function handle(WholeFoodsConnector $connector): void
-    {
-        $categories = $this->getCategories();
-
-        if ($categories->isEmpty()) {
-            $this->warn('No categories to scrape. Run seed:categories first.');
-
-            return;
-        }
-
-        foreach ($categories as $category) {
-            $this->scrapeCategory($connector, $category);
-        }
-    }
-
-    /** @return \Illuminate\Database\Eloquent\Collection<int, Category> */
-    protected function getCategories(): \Illuminate\Database\Eloquent\Collection
-    {
-        $query = Category::query();
-
-        if ($slug = $this->option('category')) {
-            $query->where('slug', $slug);
-        }
-
-        return $query->get();
-    }
-
-    protected function scrapeCategory(WholeFoodsConnector $connector, Category $category): void
-    {
-        if (! $this->option('force') && ! $category->needsScraping()) {
-            $this->line("Skipping {$category->name} — still fresh.");
-
-            return;
-        }
-
-        $this->info("Scraping {$category->name}...");
-        $startTime = now();
-        $productsCreated = 0;
-        $productsUpdated = 0;
-        $productsFound = 0;
-        $errors = 0;
-        $errorDetails = [];
-        $limit = (int) $this->option('limit');
-
-        for ($page = 1; $page <= $limit; $page++) {
-            $this->line("  Page {$page}...");
-
-            $request = new GetProductsRequest($category->slug, $page);
-            $response = $connector->send($request);
-
-            if ($response->failed()) {
-                $errors++;
-                $errorDetails[] = [
-                    'page' => $page,
-                    'status' => $response->status(),
-                ];
-                $this->error("  HTTP {$response->status()} on page {$page}");
-
-                break;
-            }
-
-            $products = $this->parseProducts($response->body());
-
-            if (empty($products)) {
-                $this->line('  No products found — end of pages.');
-
-                break;
-            }
-
-            $productsFound += count($products);
-
-            foreach ($products as $productData) {
-                $result = $this->upsertProduct($category, $productData);
-                $result === 'created' ? $productsCreated++ : $productsUpdated++;
-            }
-
-            $category->update(['last_page_scraped' => $page]);
-
-            $this->applyDelay();
-        }
-
-        $category->update(['last_scraped_at' => now()]);
-
-        ScrapeLog::create([
-            'category_id' => $category->id,
-            'command' => 'scrape:products',
-            'products_found' => $productsFound,
-            'products_created' => $productsCreated,
-            'products_updated' => $productsUpdated,
-            'errors' => $errors,
-            'error_details' => $errorDetails ?: null,
-            'duration_seconds' => $startTime->diffInSeconds(now()),
-            'created_at' => now(),
-        ]);
-
-        $this->info("  Done: {$productsCreated} created, {$productsUpdated} updated, {$errors} errors.");
-    }
-
-    /** @return array<int, array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null}> */
-    protected function parseProducts(string $html): array
-    {
-        $crawler = new Crawler($html);
-        $products = [];
-
-        $crawler->filter('[data-testid="product-tile"]')->each(function (Crawler $node) use (&$products) {
-            $name = $this->extractText($node, 'h2');
-
-            if (! $name) {
-                return;
-            }
-
-            $products[] = [
-                'name' => $name,
-                'brand' => $this->extractText($node, '[class*="brand"]'),
-                'price' => $this->extractPrice($node),
-                'unit' => $this->extractText($node, '[data-testid="product-tile-unit"]'),
-                'url' => $this->extractAttr($node, 'a', 'href'),
-                'image_url' => $this->extractAttr($node, 'img', 'src'),
-            ];
-        });
-
-        return $products;
-    }
-
     /** @param array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null} $data */
-    protected function upsertProduct(Category $category, array $data): string
+    public function execute(Category $category, array $data): string
     {
         $product = Product::where('category_id', $category->id)
             ->where('name', $data['name'])
@@ -1455,65 +1426,31 @@ class ScrapeProductsCommand extends Command
 
         return 'created';
     }
-
-    protected function applyDelay(): void
-    {
-        $baseDelay = (float) config('scraping.delay.initial_seconds', 5);
-        $jitter = (float) config('scraping.delay.jitter_max_seconds', 3);
-        $totalDelay = $baseDelay + (mt_rand(0, (int) ($jitter * 1000)) / 1000);
-
-        usleep((int) ($totalDelay * 1_000_000));
-    }
-
-    protected function extractText(Crawler $node, string $selector): ?string
-    {
-        $filtered = $node->filter($selector);
-
-        return $filtered->count() > 0 ? trim($filtered->text('')) : null;
-    }
-
-    protected function extractAttr(Crawler $node, string $selector, string $attr): ?string
-    {
-        $filtered = $node->filter($selector);
-
-        return $filtered->count() > 0 ? $filtered->attr($attr) : null;
-    }
-
-    protected function extractPrice(Crawler $node): ?string
-    {
-        $text = $this->extractText($node, '[data-testid="product-tile-price"]');
-
-        if (! $text) {
-            return null;
-        }
-
-        preg_match('/[\d.]+/', $text, $matches);
-
-        return $matches[0] ?? null;
-    }
 }
 ```
 
-**Step 5: Run test to verify it passes**
+**Step 4: Run test to verify it passes**
 
-Run: `./vendor/bin/pest --filter ScrapeProductsCommandTest`
+Run: `./vendor/bin/pest --filter UpsertProductTest`
 
 Expected: PASS
 
-**Step 6: Commit**
+**Step 5: Commit**
 
 ```bash
-git add app/Commands/ScrapeProductsCommand.php app/Crawlers/ProductCrawlObserver.php tests/Feature/ScrapeProductsCommandTest.php
-git commit -m "Add scrape:products command with HTML parsing and upsert logic"
+git add app/Actions/UpsertProduct.php tests/Unit/UpsertProductTest.php
+git commit -m "Add UpsertProduct action"
 ```
 
 ---
 
-### Task 11: Create enrich:nutrition command
+### Task 11: Create NutritionResolver support class
+
+This is the brains behind nutrition enrichment. It tries Open Food Facts, then USDA, and returns normalized data. The command just calls this and saves the result.
 
 **Files:**
-- Create: `app/Commands/EnrichNutritionCommand.php`
-- Test: `tests/Feature/EnrichNutritionCommandTest.php`
+- Create: `app/Support/NutritionResolver.php`
+- Test: `tests/Feature/NutritionResolverTest.php`
 
 **Step 1: Write the failing test**
 
@@ -1525,8 +1462,8 @@ use App\Http\Integrations\OpenFoodFacts\Requests\SearchProductsRequest;
 use App\Http\Integrations\Usda\Requests\SearchFoodsRequest;
 use App\Http\Integrations\Usda\UsdaConnector;
 use App\Models\Category;
-use App\Models\Nutrition;
 use App\Models\Product;
+use App\Support\NutritionResolver;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Saloon\Http\Faking\MockClient;
 use Saloon\Http\Faking\MockResponse;
@@ -1537,8 +1474,8 @@ beforeEach(function () {
     Saloon\Config::preventStrayRequests();
 });
 
-it('enriches product nutrition from open food facts', function () {
-    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+it('resolves nutrition from open food facts', function () {
+    $category = Category::create(['name' => 'Dairy', 'slug' => 'dairy']);
     $product = Product::create([
         'category_id' => $category->id,
         'name' => 'Organic Whole Milk',
@@ -1568,25 +1505,25 @@ it('enriches product nutrition from open food facts', function () {
 
     $offConnector = new OpenFoodFactsConnector;
     $offConnector->withMockClient($mockClient);
-    $this->app->instance(OpenFoodFactsConnector::class, $offConnector);
 
-    $this->artisan('enrich:nutrition')
-        ->assertExitCode(0);
+    $usdaConnector = new UsdaConnector;
 
-    expect(Nutrition::count())->toBe(1);
+    $resolver = new NutritionResolver($offConnector, $usdaConnector);
+    $result = $resolver->resolve($product);
 
-    $nutrition = $product->fresh()->nutrition;
-    expect($nutrition->source)->toBe('open_food_facts');
-    expect((float) $nutrition->calories)->toBe(150.0);
-    expect((float) $nutrition->protein_g)->toBe(8.0);
+    expect($result)->not->toBeNull();
+    expect($result['source'])->toBe('open_food_facts');
+    expect($result['calories'])->toBe(150.0);
+    expect($result['protein_g'])->toBe(8.0);
+    expect($result['sodium_mg'])->toBe(125.0);
+    expect($result['serving_size'])->toBe('1 cup (240ml)');
 });
 
 it('falls back to usda when open food facts has no results', function () {
-    $category = Category::create(['name' => 'Meat & Poultry', 'slug' => 'meat']);
+    $category = Category::create(['name' => 'Meat', 'slug' => 'meat']);
     $product = Product::create([
         'category_id' => $category->id,
         'name' => 'Chicken Breast',
-        'brand' => null,
         'price' => 6.99,
     ]);
 
@@ -1600,7 +1537,7 @@ it('falls back to usda when open food facts has no results', function () {
         SearchFoodsRequest::class => MockResponse::make([
             'foods' => [
                 [
-                    'description' => 'Chicken, broilers or fryers, breast, skinless, boneless, meat only, raw',
+                    'description' => 'Chicken breast, raw',
                     'foodNutrients' => [
                         ['nutrientName' => 'Energy', 'value' => 120, 'unitName' => 'KCAL'],
                         ['nutrientName' => 'Protein', 'value' => 22.5, 'unitName' => 'G'],
@@ -1619,135 +1556,87 @@ it('falls back to usda when open food facts has no results', function () {
 
     $offConnector = new OpenFoodFactsConnector;
     $offConnector->withMockClient($offMock);
-    $this->app->instance(OpenFoodFactsConnector::class, $offConnector);
 
     $usdaConnector = new UsdaConnector;
     $usdaConnector->withMockClient($usdaMock);
-    $this->app->instance(UsdaConnector::class, $usdaConnector);
 
-    $this->artisan('enrich:nutrition')
-        ->assertExitCode(0);
+    $resolver = new NutritionResolver($offConnector, $usdaConnector);
+    $result = $resolver->resolve($product);
 
-    $nutrition = $product->fresh()->nutrition;
-    expect($nutrition->source)->toBe('usda');
-    expect((float) $nutrition->protein_g)->toBe(22.5);
+    expect($result)->not->toBeNull();
+    expect($result['source'])->toBe('usda');
+    expect($result['protein_g'])->toBe(22.5);
+    expect($result['sodium_mg'])->toBe(74.0);
 });
 
-it('skips products that already have nutrition', function () {
+it('returns null when no source has data', function () {
     $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
     $product = Product::create([
         'category_id' => $category->id,
-        'name' => 'Organic Bananas',
-        'price' => 0.29,
+        'name' => 'Mystery Fruit',
+        'price' => 2.99,
     ]);
 
-    Nutrition::create([
-        'product_id' => $product->id,
-        'calories' => 105,
-        'protein_g' => 1.3,
-        'fat_g' => 0.4,
-        'carbs_g' => 27,
-        'source' => 'manual',
+    config()->set('scraping.usda.api_key', 'test-key');
+
+    $offMock = new MockClient([
+        SearchProductsRequest::class => MockResponse::make(['products' => []], 200),
     ]);
 
-    $this->artisan('enrich:nutrition')
-        ->assertExitCode(0);
+    $usdaMock = new MockClient([
+        SearchFoodsRequest::class => MockResponse::make(['foods' => []], 200),
+    ]);
 
-    expect(Nutrition::count())->toBe(1);
+    $offConnector = new OpenFoodFactsConnector;
+    $offConnector->withMockClient($offMock);
+
+    $usdaConnector = new UsdaConnector;
+    $usdaConnector->withMockClient($usdaMock);
+
+    $resolver = new NutritionResolver($offConnector, $usdaConnector);
+
+    expect($resolver->resolve($product))->toBeNull();
 });
 ```
 
 **Step 2: Run test to verify it fails**
 
-Run: `./vendor/bin/pest --filter EnrichNutritionCommandTest`
+Run: `./vendor/bin/pest --filter NutritionResolverTest`
 
-Expected: FAIL — command not found.
+Expected: FAIL — class doesn't exist.
 
-**Step 3: Write the command**
+**Step 3: Write the resolver**
 
 ```php
 <?php
 
-namespace App\Commands;
+namespace App\Support;
 
 use App\Http\Integrations\OpenFoodFacts\OpenFoodFactsConnector;
 use App\Http\Integrations\OpenFoodFacts\Requests\SearchProductsRequest;
 use App\Http\Integrations\Usda\Requests\SearchFoodsRequest;
 use App\Http\Integrations\Usda\UsdaConnector;
-use App\Models\Nutrition;
 use App\Models\Product;
-use LaravelZero\Framework\Commands\Command;
 
-class EnrichNutritionCommand extends Command
+class NutritionResolver
 {
-    protected $signature = 'enrich:nutrition
-        {--source= : Only use a specific source (open_food_facts, usda)}
-        {--force : Re-enrich products that already have nutrition}
-        {--limit=100 : Max products to enrich per run}';
+    public function __construct(
+        protected OpenFoodFactsConnector $offConnector,
+        protected UsdaConnector $usdaConnector,
+    ) {}
 
-    protected $description = 'Enrich products with nutrition data from Open Food Facts and USDA';
-
-    public function handle(
-        OpenFoodFactsConnector $offConnector,
-        UsdaConnector $usdaConnector,
-    ): void {
-        $query = Product::query();
-
-        if (! $this->option('force')) {
-            $query->whereDoesntHave('nutrition');
-        }
-
-        $products = $query->limit((int) $this->option('limit'))->get();
-
-        if ($products->isEmpty()) {
-            $this->info('All products already have nutrition data.');
-
-            return;
-        }
-
-        $this->info("Enriching {$products->count()} products...");
-        $enriched = 0;
-        $failed = 0;
-
-        foreach ($products as $product) {
-            $this->line("  {$product->name}...");
-
-            $source = $this->option('source');
-
-            if (! $source || $source === 'open_food_facts') {
-                $nutrition = $this->tryOpenFoodFacts($offConnector, $product);
-
-                if ($nutrition) {
-                    $this->saveNutrition($product, $nutrition, 'open_food_facts');
-                    $enriched++;
-
-                    continue;
-                }
-            }
-
-            if (! $source || $source === 'usda') {
-                $nutrition = $this->tryUsda($usdaConnector, $product);
-
-                if ($nutrition) {
-                    $this->saveNutrition($product, $nutrition, 'usda');
-                    $enriched++;
-
-                    continue;
-                }
-            }
-
-            $failed++;
-            $this->warn("    No nutrition data found.");
-        }
-
-        $this->info("Done: {$enriched} enriched, {$failed} not found.");
+    /** @return array{calories: float|null, protein_g: float|null, fat_g: float|null, carbs_g: float|null, fiber_g: float|null, sugar_g: float|null, sodium_mg: float|null, serving_size: string|null, source: string}|null */
+    public function resolve(Product $product): ?array
+    {
+        return $this->tryOpenFoodFacts($product)
+            ?? $this->tryUsda($product);
     }
 
-    /** @return array{calories: float|null, protein_g: float|null, fat_g: float|null, carbs_g: float|null, fiber_g: float|null, sugar_g: float|null, sodium_mg: float|null, serving_size: string|null}|null */
-    protected function tryOpenFoodFacts(OpenFoodFactsConnector $connector, Product $product): ?array
+    /** @return array{calories: float|null, protein_g: float|null, fat_g: float|null, carbs_g: float|null, fiber_g: float|null, sugar_g: float|null, sodium_mg: float|null, serving_size: string|null, source: string}|null */
+    protected function tryOpenFoodFacts(Product $product): ?array
     {
         $searchTerm = trim("{$product->brand} {$product->name}");
-        $response = $connector->send(new SearchProductsRequest($searchTerm, 3));
+        $response = $this->offConnector->send(new SearchProductsRequest($searchTerm, 3));
 
         if ($response->failed()) {
             return null;
@@ -1759,25 +1648,25 @@ class EnrichNutritionCommand extends Command
             return null;
         }
 
-        $match = $products[0];
-        $nutriments = $match['nutriments'] ?? [];
+        $nutriments = $products[0]['nutriments'] ?? [];
 
         return [
-            'calories' => $nutriments['energy-kcal_serving'] ?? $nutriments['energy-kcal_100g'] ?? null,
-            'protein_g' => $nutriments['proteins_serving'] ?? $nutriments['proteins_100g'] ?? null,
-            'fat_g' => $nutriments['fat_serving'] ?? $nutriments['fat_100g'] ?? null,
-            'carbs_g' => $nutriments['carbohydrates_serving'] ?? $nutriments['carbohydrates_100g'] ?? null,
-            'fiber_g' => $nutriments['fiber_serving'] ?? $nutriments['fiber_100g'] ?? null,
-            'sugar_g' => $nutriments['sugars_serving'] ?? $nutriments['sugars_100g'] ?? null,
+            'calories' => $this->floatOrNull($nutriments['energy-kcal_serving'] ?? $nutriments['energy-kcal_100g'] ?? null),
+            'protein_g' => $this->floatOrNull($nutriments['proteins_serving'] ?? $nutriments['proteins_100g'] ?? null),
+            'fat_g' => $this->floatOrNull($nutriments['fat_serving'] ?? $nutriments['fat_100g'] ?? null),
+            'carbs_g' => $this->floatOrNull($nutriments['carbohydrates_serving'] ?? $nutriments['carbohydrates_100g'] ?? null),
+            'fiber_g' => $this->floatOrNull($nutriments['fiber_serving'] ?? $nutriments['fiber_100g'] ?? null),
+            'sugar_g' => $this->floatOrNull($nutriments['sugars_serving'] ?? $nutriments['sugars_100g'] ?? null),
             'sodium_mg' => $this->sodiumToMg($nutriments['sodium_serving'] ?? $nutriments['sodium_100g'] ?? null),
-            'serving_size' => $match['serving_size'] ?? null,
+            'serving_size' => $products[0]['serving_size'] ?? null,
+            'source' => 'open_food_facts',
         ];
     }
 
-    /** @return array{calories: float|null, protein_g: float|null, fat_g: float|null, carbs_g: float|null, fiber_g: float|null, sugar_g: float|null, sodium_mg: float|null, serving_size: string|null}|null */
-    protected function tryUsda(UsdaConnector $connector, Product $product): ?array
+    /** @return array{calories: float|null, protein_g: float|null, fat_g: float|null, carbs_g: float|null, fiber_g: float|null, sugar_g: float|null, sodium_mg: float|null, serving_size: string|null, source: string}|null */
+    protected function tryUsda(Product $product): ?array
     {
-        $response = $connector->send(new SearchFoodsRequest($product->name, 3));
+        $response = $this->usdaConnector->send(new SearchFoodsRequest($product->name, 3));
 
         if ($response->failed()) {
             return null;
@@ -1797,46 +1686,717 @@ class EnrichNutritionCommand extends Command
             : null;
 
         return [
-            'calories' => $this->findNutrient($nutrients, 'Energy'),
-            'protein_g' => $this->findNutrient($nutrients, 'Protein'),
-            'fat_g' => $this->findNutrient($nutrients, 'Total lipid (fat)'),
-            'carbs_g' => $this->findNutrient($nutrients, 'Carbohydrate, by difference'),
-            'fiber_g' => $this->findNutrient($nutrients, 'Fiber, total dietary'),
-            'sugar_g' => $this->findNutrient($nutrients, 'Sugars, total including NLEA'),
-            'sodium_mg' => $this->findNutrient($nutrients, 'Sodium, Na'),
+            'calories' => $this->nutrient($nutrients, 'Energy'),
+            'protein_g' => $this->nutrient($nutrients, 'Protein'),
+            'fat_g' => $this->nutrient($nutrients, 'Total lipid (fat)'),
+            'carbs_g' => $this->nutrient($nutrients, 'Carbohydrate, by difference'),
+            'fiber_g' => $this->nutrient($nutrients, 'Fiber, total dietary'),
+            'sugar_g' => $this->nutrient($nutrients, 'Sugars, total including NLEA'),
+            'sodium_mg' => $this->nutrient($nutrients, 'Sodium, Na'),
             'serving_size' => $servingSize,
+            'source' => 'usda',
         ];
     }
 
     /** @param \Illuminate\Support\Collection<int, array{nutrientName: string, value: float, unitName: string}> $nutrients */
-    protected function findNutrient(\Illuminate\Support\Collection $nutrients, string $name): ?float
+    protected function nutrient(\Illuminate\Support\Collection $nutrients, string $name): ?float
     {
-        $nutrient = $nutrients->firstWhere('nutrientName', $name);
+        $match = $nutrients->firstWhere('nutrientName', $name);
 
-        return $nutrient ? (float) $nutrient['value'] : null;
+        return $match ? (float) $match['value'] : null;
     }
 
-    /** @param array{calories: float|null, protein_g: float|null, fat_g: float|null, carbs_g: float|null, fiber_g: float|null, sugar_g: float|null, sodium_mg: float|null, serving_size: string|null} $data */
-    protected function saveNutrition(Product $product, array $data, string $source): void
+    protected function floatOrNull(mixed $value): ?float
     {
-        Nutrition::updateOrCreate(
-            ['product_id' => $product->id],
-            [
-                ...$data,
-                'source' => $source,
-            ]
-        );
-
-        $this->info("    Saved from {$source}: {$data['calories']} cal");
+        return $value !== null ? (float) $value : null;
     }
 
-    protected function sodiumToMg(?float $sodiumGrams): ?float
+    protected function sodiumToMg(mixed $sodiumGrams): ?float
     {
         if ($sodiumGrams === null) {
             return null;
         }
 
-        return $sodiumGrams * 1000;
+        return (float) $sodiumGrams * 1000;
+    }
+}
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `./vendor/bin/pest --filter NutritionResolverTest`
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add app/Support/NutritionResolver.php tests/Feature/NutritionResolverTest.php
+git commit -m "Add NutritionResolver with Open Food Facts and USDA fallback"
+```
+
+---
+
+### Task 12: Create EnrichProductNutrition action
+
+Thin action that saves resolved nutrition data to a product.
+
+**Files:**
+- Create: `app/Actions/EnrichProductNutrition.php`
+- Test: `tests/Unit/EnrichProductNutritionTest.php`
+
+**Step 1: Write the failing test**
+
+```php
+<?php
+
+use App\Actions\EnrichProductNutrition;
+use App\Models\Category;
+use App\Models\Nutrition;
+use App\Models\Product;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+uses(RefreshDatabase::class);
+
+it('saves nutrition data to a product', function () {
+    $category = Category::create(['name' => 'Dairy', 'slug' => 'dairy']);
+    $product = Product::create([
+        'category_id' => $category->id,
+        'name' => 'Organic Whole Milk',
+        'price' => 4.99,
+    ]);
+
+    (new EnrichProductNutrition)->execute($product, [
+        'calories' => 150.0,
+        'protein_g' => 8.0,
+        'fat_g' => 8.0,
+        'carbs_g' => 12.0,
+        'fiber_g' => 0.0,
+        'sugar_g' => 12.0,
+        'sodium_mg' => 125.0,
+        'serving_size' => '1 cup (240ml)',
+        'source' => 'open_food_facts',
+    ]);
+
+    expect(Nutrition::count())->toBe(1);
+
+    $nutrition = $product->fresh()->nutrition;
+    expect($nutrition->source)->toBe('open_food_facts');
+    expect((float) $nutrition->calories)->toBe(150.0);
+});
+
+it('updates existing nutrition when re-enriching', function () {
+    $category = Category::create(['name' => 'Dairy', 'slug' => 'dairy']);
+    $product = Product::create([
+        'category_id' => $category->id,
+        'name' => 'Organic Whole Milk',
+        'price' => 4.99,
+    ]);
+
+    Nutrition::create([
+        'product_id' => $product->id,
+        'calories' => 100,
+        'source' => 'manual',
+    ]);
+
+    (new EnrichProductNutrition)->execute($product, [
+        'calories' => 150.0,
+        'protein_g' => 8.0,
+        'fat_g' => null,
+        'carbs_g' => null,
+        'fiber_g' => null,
+        'sugar_g' => null,
+        'sodium_mg' => null,
+        'serving_size' => null,
+        'source' => 'open_food_facts',
+    ]);
+
+    expect(Nutrition::count())->toBe(1);
+    expect((float) $product->fresh()->nutrition->calories)->toBe(150.0);
+    expect($product->fresh()->nutrition->source)->toBe('open_food_facts');
+});
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `./vendor/bin/pest --filter EnrichProductNutritionTest`
+
+Expected: FAIL — class doesn't exist.
+
+**Step 3: Write the action**
+
+```php
+<?php
+
+namespace App\Actions;
+
+use App\Models\Nutrition;
+use App\Models\Product;
+
+class EnrichProductNutrition
+{
+    /** @param array{calories: float|null, protein_g: float|null, fat_g: float|null, carbs_g: float|null, fiber_g: float|null, sugar_g: float|null, sodium_mg: float|null, serving_size: string|null, source: string} $data */
+    public function execute(Product $product, array $data): void
+    {
+        Nutrition::updateOrCreate(
+            ['product_id' => $product->id],
+            $data,
+        );
+    }
+}
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `./vendor/bin/pest --filter EnrichProductNutritionTest`
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add app/Actions/EnrichProductNutrition.php tests/Unit/EnrichProductNutritionTest.php
+git commit -m "Add EnrichProductNutrition action"
+```
+
+---
+
+### Task 13: Create scrape:discover command
+
+Exploration command — hits the Whole Foods site and prints what it finds. Does not persist data.
+
+**Files:**
+- Create: `app/Commands/ScrapeDiscoverCommand.php`
+- Test: `tests/Feature/Commands/ScrapeDiscoverCommandTest.php`
+
+**Step 1: Write the failing test**
+
+```php
+<?php
+
+use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
+use Saloon\Http\Faking\MockClient;
+use Saloon\Http\Faking\MockResponse;
+
+beforeEach(function () {
+    Saloon\Config::preventStrayRequests();
+});
+
+it('discovers product page structure', function () {
+    $html = <<<'HTML'
+    <html><body>
+        <div class="w-pie--product-tile" data-testid="product-tile">
+            <h2>Organic Bananas</h2>
+            <span data-testid="product-tile-price">$0.29</span>
+        </div>
+    </body></html>
+    HTML;
+
+    $mockClient = new MockClient([
+        '*' => MockResponse::make($html, 200),
+    ]);
+
+    $connector = new WholeFoodsConnector;
+    $connector->withMockClient($mockClient);
+    $this->app->instance(WholeFoodsConnector::class, $connector);
+
+    $this->artisan('scrape:discover', ['--category' => 'produce'])
+        ->assertExitCode(0);
+});
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `./vendor/bin/pest --filter ScrapeDiscoverCommandTest`
+
+Expected: FAIL — command not found.
+
+**Step 3: Write the command**
+
+```php
+<?php
+
+namespace App\Commands;
+
+use App\Http\Integrations\WholeFoods\Requests\GetProductsRequest;
+use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
+use App\Support\ProductPageParser;
+use LaravelZero\Framework\Commands\Command;
+
+class ScrapeDiscoverCommand extends Command
+{
+    protected $signature = 'scrape:discover
+        {--category=produce : Category slug to explore}';
+
+    protected $description = 'Explore the Whole Foods site to discover product page structure';
+
+    public function handle(WholeFoodsConnector $connector, ProductPageParser $parser): void
+    {
+        $category = $this->option('category');
+        $this->info("Discovering product page structure for: {$category}");
+
+        $response = $connector->send(new GetProductsRequest($category));
+
+        $this->line("Status: {$response->status()}");
+        $this->line("Content-Type: {$response->header('Content-Type')}");
+        $this->line("Body length: " . strlen($response->body()) . " bytes");
+
+        if (str_contains($response->header('Content-Type') ?? '', 'json')) {
+            $this->info('Response is JSON — API endpoint found!');
+            $this->line(json_encode(json_decode($response->body()), JSON_PRETTY_PRINT));
+
+            return;
+        }
+
+        $products = $parser->parse($response->body());
+        $this->info("Found {$count = count($products)} products with current selectors.");
+
+        foreach (array_slice($products, 0, 3) as $product) {
+            $this->table(
+                ['Field', 'Value'],
+                collect($product)->map(fn ($v, $k) => [$k, $v ?? '(null)'])->values()->all()
+            );
+        }
+
+        if ($count === 0) {
+            $this->warn('No products found. Selectors may need updating in ProductPageParser.');
+        }
+    }
+}
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `./vendor/bin/pest --filter ScrapeDiscoverCommandTest`
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add app/Commands/ScrapeDiscoverCommand.php tests/Feature/Commands/ScrapeDiscoverCommandTest.php
+git commit -m "Add scrape:discover command for site exploration"
+```
+
+---
+
+### Task 14: Create scrape:products command (thin)
+
+Now the command is thin — delegates to `ProductPageParser` and `UpsertProduct`.
+
+**Files:**
+- Create: `app/Commands/ScrapeProductsCommand.php`
+- Test: `tests/Feature/Commands/ScrapeProductsCommandTest.php`
+
+**Step 1: Write the failing test**
+
+```php
+<?php
+
+use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
+use App\Models\Category;
+use App\Models\Product;
+use App\Models\ScrapeLog;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Saloon\Http\Faking\MockClient;
+use Saloon\Http\Faking\MockResponse;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Saloon\Config::preventStrayRequests();
+});
+
+it('scrapes products and stores them', function () {
+    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+
+    $html = <<<'HTML'
+    <html><body>
+        <div data-testid="product-tile">
+            <h2>Organic Bananas</h2>
+            <span class="w-pie--product-tile__brand">365</span>
+            <span data-testid="product-tile-price">$0.29</span>
+        </div>
+        <div data-testid="product-tile">
+            <h2>Organic Avocados</h2>
+            <span class="w-pie--product-tile__brand">Whole Foods</span>
+            <span data-testid="product-tile-price">$1.99</span>
+        </div>
+    </body></html>
+    HTML;
+
+    $mockClient = new MockClient([
+        '*' => MockResponse::make($html, 200),
+    ]);
+
+    $connector = new WholeFoodsConnector;
+    $connector->withMockClient($mockClient);
+    $this->app->instance(WholeFoodsConnector::class, $connector);
+
+    $this->artisan('scrape:products', ['--category' => 'produce', '--limit' => 1])
+        ->assertExitCode(0);
+
+    expect(Product::count())->toBe(2);
+    expect(Product::where('name', 'Organic Bananas')->first()->price)->toBe('0.29');
+    expect(ScrapeLog::count())->toBe(1);
+    expect(ScrapeLog::first()->products_created)->toBe(2);
+});
+
+it('updates existing product prices on re-scrape', function () {
+    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+    Product::create([
+        'category_id' => $category->id,
+        'name' => 'Organic Bananas',
+        'brand' => '365',
+        'price' => 0.25,
+    ]);
+
+    $html = <<<'HTML'
+    <html><body>
+        <div data-testid="product-tile">
+            <h2>Organic Bananas</h2>
+            <span class="w-pie--product-tile__brand">365</span>
+            <span data-testid="product-tile-price">$0.29</span>
+        </div>
+    </body></html>
+    HTML;
+
+    $mockClient = new MockClient([
+        '*' => MockResponse::make($html, 200),
+    ]);
+
+    $connector = new WholeFoodsConnector;
+    $connector->withMockClient($mockClient);
+    $this->app->instance(WholeFoodsConnector::class, $connector);
+
+    $this->artisan('scrape:products', ['--category' => 'produce', '--force' => true, '--limit' => 1])
+        ->assertExitCode(0);
+
+    expect(Product::count())->toBe(1);
+    expect(Product::first()->price)->toBe('0.29');
+    expect(ScrapeLog::first()->products_updated)->toBe(1);
+});
+
+it('skips fresh categories without --force', function () {
+    Category::create([
+        'name' => 'Produce',
+        'slug' => 'produce',
+        'last_scraped_at' => now(),
+    ]);
+
+    $this->artisan('scrape:products', ['--category' => 'produce'])
+        ->expectsOutput('Skipping Produce — still fresh.')
+        ->assertExitCode(0);
+
+    expect(Product::count())->toBe(0);
+});
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `./vendor/bin/pest --filter ScrapeProductsCommandTest`
+
+Expected: FAIL — command not found.
+
+**Step 3: Write the thin command**
+
+```php
+<?php
+
+namespace App\Commands;
+
+use App\Actions\UpsertProduct;
+use App\Http\Integrations\WholeFoods\Requests\GetProductsRequest;
+use App\Http\Integrations\WholeFoods\WholeFoodsConnector;
+use App\Models\Category;
+use App\Models\ScrapeLog;
+use App\Support\ProductPageParser;
+use LaravelZero\Framework\Commands\Command;
+
+class ScrapeProductsCommand extends Command
+{
+    protected $signature = 'scrape:products
+        {--category= : Scrape a single category by slug}
+        {--force : Ignore freshness interval}
+        {--limit=10 : Max pages per category}';
+
+    protected $description = 'Scrape products from Whole Foods';
+
+    public function handle(
+        WholeFoodsConnector $connector,
+        ProductPageParser $parser,
+        UpsertProduct $upsertProduct,
+    ): void {
+        $categories = $this->categories();
+
+        if ($categories->isEmpty()) {
+            $this->warn('No categories found. Run seed:categories first.');
+
+            return;
+        }
+
+        foreach ($categories as $category) {
+            $this->scrapeCategory($connector, $parser, $upsertProduct, $category);
+        }
+    }
+
+    protected function scrapeCategory(
+        WholeFoodsConnector $connector,
+        ProductPageParser $parser,
+        UpsertProduct $upsertProduct,
+        Category $category,
+    ): void {
+        if (! $this->option('force') && ! $category->needsScraping()) {
+            $this->line("Skipping {$category->name} — still fresh.");
+
+            return;
+        }
+
+        $this->info("Scraping {$category->name}...");
+
+        $startTime = now();
+        $created = 0;
+        $updated = 0;
+        $found = 0;
+        $errors = 0;
+        $errorDetails = [];
+        $limit = (int) $this->option('limit');
+
+        for ($page = 1; $page <= $limit; $page++) {
+            $this->line("  Page {$page}...");
+
+            $response = $connector->send(new GetProductsRequest($category->slug, $page));
+
+            if ($response->failed()) {
+                $errors++;
+                $errorDetails[] = ['page' => $page, 'status' => $response->status()];
+                $this->error("  HTTP {$response->status()} on page {$page}");
+
+                break;
+            }
+
+            $products = $parser->parse($response->body());
+
+            if (empty($products)) {
+                $this->line('  No products found — end of pages.');
+
+                break;
+            }
+
+            $found += count($products);
+
+            foreach ($products as $productData) {
+                $upsertProduct->execute($category, $productData) === 'created'
+                    ? $created++
+                    : $updated++;
+            }
+
+            $category->update(['last_page_scraped' => $page]);
+
+            $this->applyDelay();
+        }
+
+        $category->update(['last_scraped_at' => now()]);
+
+        ScrapeLog::create([
+            'category_id' => $category->id,
+            'command' => 'scrape:products',
+            'products_found' => $found,
+            'products_created' => $created,
+            'products_updated' => $updated,
+            'errors' => $errors,
+            'error_details' => $errorDetails ?: null,
+            'duration_seconds' => $startTime->diffInSeconds(now()),
+            'created_at' => now(),
+        ]);
+
+        $this->info("  Done: {$created} created, {$updated} updated, {$errors} errors.");
+    }
+
+    /** @return \Illuminate\Database\Eloquent\Collection<int, Category> */
+    protected function categories(): \Illuminate\Database\Eloquent\Collection
+    {
+        $query = Category::query();
+
+        if ($slug = $this->option('category')) {
+            $query->bySlug($slug);
+        }
+
+        return $query->get();
+    }
+
+    protected function applyDelay(): void
+    {
+        $base = (float) config('scraping.delay.initial_seconds', 5);
+        $jitter = (float) config('scraping.delay.jitter_max_seconds', 3);
+        $total = $base + (mt_rand(0, (int) ($jitter * 1000)) / 1000);
+
+        usleep((int) ($total * 1_000_000));
+    }
+}
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `./vendor/bin/pest --filter ScrapeProductsCommandTest`
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add app/Commands/ScrapeProductsCommand.php tests/Feature/Commands/ScrapeProductsCommandTest.php
+git commit -m "Add thin scrape:products command"
+```
+
+---
+
+### Task 15: Create enrich:nutrition command (thin)
+
+Thin command — delegates to `NutritionResolver` and `EnrichProductNutrition`.
+
+**Files:**
+- Create: `app/Commands/EnrichNutritionCommand.php`
+- Test: `tests/Feature/Commands/EnrichNutritionCommandTest.php`
+
+**Step 1: Write the failing test**
+
+```php
+<?php
+
+use App\Http\Integrations\OpenFoodFacts\OpenFoodFactsConnector;
+use App\Http\Integrations\OpenFoodFacts\Requests\SearchProductsRequest;
+use App\Http\Integrations\Usda\UsdaConnector;
+use App\Models\Category;
+use App\Models\Nutrition;
+use App\Models\Product;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Saloon\Http\Faking\MockClient;
+use Saloon\Http\Faking\MockResponse;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    Saloon\Config::preventStrayRequests();
+});
+
+it('enriches products missing nutrition', function () {
+    $category = Category::create(['name' => 'Dairy', 'slug' => 'dairy']);
+    Product::create([
+        'category_id' => $category->id,
+        'name' => 'Organic Milk',
+        'brand' => '365',
+        'price' => 4.99,
+    ]);
+
+    $mockClient = new MockClient([
+        SearchProductsRequest::class => MockResponse::make([
+            'products' => [[
+                'product_name' => 'Organic Milk',
+                'nutriments' => [
+                    'energy-kcal_serving' => 150,
+                    'proteins_serving' => 8,
+                    'fat_serving' => 8,
+                    'carbohydrates_serving' => 12,
+                    'fiber_serving' => 0,
+                    'sugars_serving' => 12,
+                    'sodium_serving' => 0.125,
+                ],
+            ]],
+        ], 200),
+    ]);
+
+    $offConnector = new OpenFoodFactsConnector;
+    $offConnector->withMockClient($mockClient);
+    $this->app->instance(OpenFoodFactsConnector::class, $offConnector);
+
+    $this->artisan('enrich:nutrition')
+        ->assertExitCode(0);
+
+    expect(Nutrition::count())->toBe(1);
+    expect(Nutrition::first()->source)->toBe('open_food_facts');
+});
+
+it('skips products that already have nutrition', function () {
+    $category = Category::create(['name' => 'Produce', 'slug' => 'produce']);
+    $product = Product::create([
+        'category_id' => $category->id,
+        'name' => 'Bananas',
+        'price' => 0.29,
+    ]);
+
+    Nutrition::create([
+        'product_id' => $product->id,
+        'calories' => 105,
+        'source' => 'manual',
+    ]);
+
+    $this->artisan('enrich:nutrition')
+        ->expectsOutput('All products already have nutrition data.')
+        ->assertExitCode(0);
+
+    expect(Nutrition::count())->toBe(1);
+});
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `./vendor/bin/pest --filter EnrichNutritionCommandTest`
+
+Expected: FAIL — command not found.
+
+**Step 3: Write the thin command**
+
+```php
+<?php
+
+namespace App\Commands;
+
+use App\Actions\EnrichProductNutrition;
+use App\Models\Product;
+use App\Support\NutritionResolver;
+use LaravelZero\Framework\Commands\Command;
+
+class EnrichNutritionCommand extends Command
+{
+    protected $signature = 'enrich:nutrition
+        {--force : Re-enrich products that already have nutrition}
+        {--limit=100 : Max products to enrich per run}';
+
+    protected $description = 'Enrich products with nutrition data from Open Food Facts and USDA';
+
+    public function handle(NutritionResolver $resolver, EnrichProductNutrition $enrichAction): void
+    {
+        $products = $this->option('force')
+            ? Product::limit((int) $this->option('limit'))->get()
+            : Product::needsNutrition()->limit((int) $this->option('limit'))->get();
+
+        if ($products->isEmpty()) {
+            $this->info('All products already have nutrition data.');
+
+            return;
+        }
+
+        $this->info("Enriching {$products->count()} products...");
+        $enriched = 0;
+        $failed = 0;
+
+        foreach ($products as $product) {
+            $this->line("  {$product->name}...");
+
+            $data = $resolver->resolve($product);
+
+            if ($data) {
+                $enrichAction->execute($product, $data);
+                $this->info("    Saved from {$data['source']}: {$data['calories']} cal");
+                $enriched++;
+            } else {
+                $this->warn('    No nutrition data found.');
+                $failed++;
+            }
+        }
+
+        $this->info("Done: {$enriched} enriched, {$failed} not found.");
     }
 }
 ```
@@ -1850,17 +2410,17 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add app/Commands/EnrichNutritionCommand.php tests/Feature/EnrichNutritionCommandTest.php
-git commit -m "Add enrich:nutrition command with Open Food Facts and USDA fallback"
+git add app/Commands/EnrichNutritionCommand.php tests/Feature/Commands/EnrichNutritionCommandTest.php
+git commit -m "Add thin enrich:nutrition command"
 ```
 
 ---
 
-### Task 12: Create scrape:update convenience command
+### Task 16: Create scrape:update convenience command
 
 **Files:**
 - Create: `app/Commands/ScrapeUpdateCommand.php`
-- Test: `tests/Feature/ScrapeUpdateCommandTest.php`
+- Test: `tests/Feature/Commands/ScrapeUpdateCommandTest.php`
 
 **Step 1: Write the failing test**
 
@@ -1877,7 +2437,7 @@ uses(RefreshDatabase::class);
 beforeEach(function () {
     Saloon\Config::preventStrayRequests();
 
-    $mockClient = MockClient::global([
+    MockClient::global([
         '*' => MockResponse::make('<html><body></body></html>', 200),
     ]);
 });
@@ -1940,55 +2500,53 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add app/Commands/ScrapeUpdateCommand.php tests/Feature/ScrapeUpdateCommandTest.php
+git add app/Commands/ScrapeUpdateCommand.php tests/Feature/Commands/ScrapeUpdateCommandTest.php
 git commit -m "Add scrape:update convenience command"
 ```
 
 ---
 
-### Task 13: Create .env file and run full test suite
+### Task 17: Clean up, .env, and full test suite
 
 **Files:**
 - Create: `.env`
+- Modify: `app/Crawlers/ProductCrawlObserver.php` (remove — replaced by ProductPageParser)
 
-**Step 1: Create .env with required keys**
+**Step 1: Create .env**
 
 ```
 USDA_API_KEY=
 ```
 
-**Step 2: Run full test suite**
+**Step 2: Delete obsolete ProductCrawlObserver**
+
+The `ProductCrawlObserver` has been replaced by `ProductPageParser`. Delete `app/Crawlers/ProductCrawlObserver.php` and the corresponding test `tests/Feature/ProductCrawlerTest.php`. Also delete `tests/Feature/HttpScrapingTest.php` — the Http facade test is a scaffold placeholder.
+
+**Step 3: Run full test suite**
 
 Run: `./vendor/bin/pest`
 
 Expected: All tests pass.
 
-**Step 3: Run Pint**
+**Step 4: Run Pint**
 
 Run: `./vendor/bin/pint --dirty`
 
-Fix any formatting issues.
-
-**Step 4: Commit everything**
+**Step 5: Commit**
 
 ```bash
-git add .env
-git commit -m "Add .env with USDA API key placeholder"
+git add -A
+git commit -m "Clean up obsolete files, add .env, format with Pint"
 ```
 
 ---
 
-### Task 14: Run scrape:discover against the live site
+### Task 18: Run scrape:discover against the live site
 
-This is a manual step — not automated. After all the code is in place:
+Manual step — not automated. After all code is in place:
 
-1. Run: `php wholefoods-data seed:categories`
-2. Run: `php wholefoods-data migrate`
+1. Run: `php wholefoods-data migrate`
+2. Run: `php wholefoods-data seed:categories`
 3. Run: `php wholefoods-data scrape:discover --category=produce`
 
-Review the output to see:
-- Which CSS selectors actually match product tiles
-- Whether the response is HTML or JSON
-- What the actual page structure looks like
-
-Then update `ScrapeProductsCommand`'s selectors to match reality. This may require iteration.
+Review the output. If selectors don't match, update `ProductPageParser` selectors and re-run. This may take a few iterations.
