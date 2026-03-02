@@ -7,7 +7,7 @@ use App\Models\Product;
 
 class UpsertProduct
 {
-    /** @param array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null} $data */
+    /** @param array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null, asin: string|null} $data */
     public function execute(Category $category, array $data): string
     {
         $product = Product::where('category_id', $category->id)
@@ -19,6 +19,7 @@ class UpsertProduct
             $product->update([
                 'price' => $data['price'],
                 'unit' => $data['unit'],
+                'asin' => $data['asin'] ?? null,
                 'whole_foods_url' => $data['url'],
                 'image_url' => $data['image_url'],
                 'last_scraped_at' => now(),
@@ -33,6 +34,7 @@ class UpsertProduct
             'brand' => $data['brand'],
             'price' => $data['price'],
             'unit' => $data['unit'],
+            'asin' => $data['asin'] ?? null,
             'whole_foods_url' => $data['url'],
             'image_url' => $data['image_url'],
             'last_scraped_at' => now(),

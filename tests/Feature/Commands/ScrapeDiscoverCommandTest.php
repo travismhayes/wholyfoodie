@@ -12,8 +12,10 @@ it('discovers product page structure', function () {
     $html = <<<'HTML'
     <html><body>
         <div class="w-pie--product-tile" data-testid="product-tile">
-            <h2>Organic Bananas</h2>
-            <span data-testid="product-tile-price">$0.29</span>
+            <a data-csa-c-content-id="ASIN: B078J118FH" href="/products/bananas">
+                <h2 data-testid="product-tile-name">Organic Bananas</h2>
+                <span data-testid="product-tile-price">$0.29</span>
+            </a>
         </div>
     </body></html>
     HTML;

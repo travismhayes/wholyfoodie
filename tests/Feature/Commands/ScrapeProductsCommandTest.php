@@ -23,14 +23,18 @@ it('scrapes products and stores them', function () {
     $html = <<<'HTML'
     <html><body>
         <div data-testid="product-tile">
-            <h2>Organic Bananas</h2>
-            <span class="w-pie--product-tile__brand">365</span>
-            <span data-testid="product-tile-price">$0.29</span>
+            <a data-csa-c-content-id="ASIN: B078J118FH" href="/products/bananas">
+                <span data-testid="product-tile-brand">365</span>
+                <h2 data-testid="product-tile-name">Organic Bananas</h2>
+                <span data-testid="product-tile-price">$0.29</span>
+            </a>
         </div>
         <div data-testid="product-tile">
-            <h2>Organic Avocados</h2>
-            <span class="w-pie--product-tile__brand">Whole Foods</span>
-            <span data-testid="product-tile-price">$1.99</span>
+            <a data-csa-c-content-id="ASIN: B00MD2F34G" href="/products/avocados">
+                <span data-testid="product-tile-brand">Whole Foods</span>
+                <h2 data-testid="product-tile-name">Organic Avocados</h2>
+                <span data-testid="product-tile-price">$1.99</span>
+            </a>
         </div>
     </body></html>
     HTML;
@@ -48,6 +52,7 @@ it('scrapes products and stores them', function () {
 
     expect(Product::count())->toBe(2);
     expect(Product::where('name', 'Organic Bananas')->first()->price)->toBe('0.29');
+    expect(Product::where('name', 'Organic Bananas')->first()->asin)->toBe('B078J118FH');
     expect(ScrapeLog::count())->toBe(1);
     expect(ScrapeLog::first()->products_created)->toBe(2);
 });
@@ -64,9 +69,11 @@ it('updates existing product prices on re-scrape', function () {
     $html = <<<'HTML'
     <html><body>
         <div data-testid="product-tile">
-            <h2>Organic Bananas</h2>
-            <span class="w-pie--product-tile__brand">365</span>
-            <span data-testid="product-tile-price">$0.29</span>
+            <a data-csa-c-content-id="ASIN: B078J118FH" href="/products/bananas">
+                <span data-testid="product-tile-brand">365</span>
+                <h2 data-testid="product-tile-name">Organic Bananas</h2>
+                <span data-testid="product-tile-price">$0.29</span>
+            </a>
         </div>
     </body></html>
     HTML;

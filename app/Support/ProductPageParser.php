@@ -8,15 +8,15 @@ class ProductPageParser
 {
     protected string $tileSelector = '[data-testid="product-tile"]';
 
-    protected string $nameSelector = 'h2';
+    protected string $nameSelector = '[data-testid="product-tile-name"]';
 
-    protected string $brandSelector = '[class*="brand"]';
+    protected string $brandSelector = '[data-testid="product-tile-brand"]';
 
     protected string $priceSelector = '[data-testid="product-tile-price"]';
 
     protected string $unitSelector = '[data-testid="product-tile-unit"]';
 
-    /** @return array<int, array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null}> */
+    /** @return array<int, array{name: string, brand: string|null, price: string|null, unit: string|null, url: string|null, image_url: string|null, asin: string|null}> */
     public function parse(string $html): array
     {
         $crawler = new Crawler($html);
@@ -35,7 +35,8 @@ class ProductPageParser
                 'price' => $this->price($node),
                 'unit' => $this->text($node, $this->unitSelector),
                 'url' => $this->attr($node, 'a', 'href'),
-                'image_url' => $this->attr($node, 'img', 'src'),
+                'image_url' => $this->lazyImage($node),
+                'asin' => $this->asin($node),
             ];
         });
 
@@ -67,5 +68,33 @@ class ProductPageParser
         preg_match('/[\d.]+/', $text, $matches);
 
         return $matches[0] ?? null;
+    }
+
+    protected function lazyImage(Crawler $node): ?string
+    {
+        $img = $node->filter('img');
+
+        if ($img->count() === 0) {
+            return null;
+        }
+
+        return $img->attr('data-src') ?? $img->attr('src');
+    }
+
+    protected function asin(Crawler $node): ?string
+    {
+        $link = $node->filter('a[data-csa-c-content-id]');
+
+        if ($link->count() === 0) {
+            return null;
+        }
+
+        $contentId = $link->attr('data-csa-c-content-id');
+
+        if ($contentId && preg_match('/ASIN:\s*(\w+)/', $contentId, $matches)) {
+            return $matches[1];
+        }
+
+        return null;
     }
 }
